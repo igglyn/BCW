@@ -1,0 +1,12 @@
+# python
+BCW/__pycache__/
+
+# dataset (surely this is useful)
+wikitext.txt
+wikitext.py
+
+# bcw artifacts
+bcw_cache.tr.chunks.npy
+bcw_cache.val.chunks.npy
+bcw.pt
+
