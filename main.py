@@ -54,7 +54,7 @@ D_MODEL = 4
 LAYERS = 1
 
 N_BYTES = 256      # fixed input/output sequence length
-STEPS = 100
+STEPS = 48000
 BS = 64
 
 
