@@ -44,6 +44,7 @@ But for transparency on why the choices were made.
 
 # Background
 The origins of this follows a decently well chain of events:
+```
 > Patching using a small model, using Byte Latent Transformers
 > 6gb 3060
 > I'm forced to learn the scaling laws of this approach
@@ -105,3 +106,4 @@ The origins of this follows a decently well chain of events:
 > Looks like BWC is a lot more stable than where it came from
 > Sure the 2x parameter cost burns but in exchange for this thing being testable sure
 > There is a lot more to do, but for now let's wrap this up and let it be
+```
