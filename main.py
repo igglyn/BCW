@@ -102,7 +102,7 @@ def main() -> None:
     run_training(model, tr_loader, val_loader, device,
                  steps=STEPS, lr=3e-3, lambda_compress=0.1)
 
-    torch.save({"config": {"d": D, "depth": LAYERS},
+    torch.save({"config": {"d": D_MODEL, "depth": LAYERS},
                 "state_dict": model.state_dict()}, "bcw.pt")
     print("saved → bcw.pt")
 
