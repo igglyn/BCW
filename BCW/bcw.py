@@ -98,7 +98,7 @@ class BCW(nn.Module):
         pad    = self.pad_embed.view(1, 1, -1).expand(B, T, -1)
 
         gated  = g * content + (1 - g) * pad               # [B, T, d]
-        ratio  = 1 - g.mean()
+        ratio  = g.mean()
         return gated, ratio
 
     def _decode(self, gated: torch.Tensor,
