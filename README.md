@@ -107,3 +107,68 @@ The origins of this follows a decently well chain of events:
 > Sure the 2x parameter cost burns but in exchange for this thing being testable sure
 > There is a lot more to do, but for now let's wrap this up and let it be
 ```
+
+# Present
+```
+> High off of the success of the project
+> There has to be similar places where this can go
+> Command the slopper to research
+> Alright, I guess geometric looks interesting
+> How does one merge all of this into Wave
+> Good question, let's start with just 2d
+> Connected most of the points over to what Wave is doing
+> minimal additions
+> Offhandedly mention wavelet, which was already supposed to be here
+> "there is no wavelet here"
+> well frick I guess that is also being added this time
+> Capacity constinues to grow, 32k
+> looking good
+> Next axis is sparsity
+> One of yous really should be implmented outside of this repo
+> add in the mechanisms in question
+> That is getting up to 131k good
+> I need to deal with these parameters
+> decoder is over 500k large
+> Surely this can be easily dealt with
+> "This constant size encoder assumes relative positions only"
+> I've had that constraint for ages
+> Preforms much better
+> That's that solved then
+> Pretty small in size now
+> Paranoia
+> Let me see if this is actually compressing
+> It is not
+> https://github.com/igglyn/BCW/commit/96c42609cce03c8244c1e269217c40adc42f924b
+> Welp that means every edit so far has only increasing the capacity for representation capacity
+> Moving back down to sane starting values
+> Alright it still compresses well
+> moving back up
+> Man these extra losses kinda suck now
+> Atomized
+> this LR is kinda balls, let's increase you
+> MORE
+> MORE
+> 1%
+> MOR- Nah that is unstable
+> Alright that is much faster
+> Completely invalidated by 131k taking just about 1M steps
+> I still want more of these parameters gone
+> Observe the encoder and decoder's mix values
+> Decoder suppresses all urge to multiply
+> Fine let's just fix that one so it never has to
+> Encoder is similarly approaching multiplication
+> One run gets nuked by it never reaches it
+> This is a bugfix
+> Okay that has changed the training to rather extreme degree
+> "It no longer trades ratio to increase the representation cost"
+> I am out of ideas
+> Figuring I should just release, yap about future plans
+> New idea, that 2d Wavelet; what about it becomes higher dim
+> 3d manages to compress much better at slightly better results
+> 4d holds decently well
+> Alright that changes the framing decently
+> Let's all in
+> allergic to more steps
+> "odd, you managed to finally how that behavior for a patching model"
+> Increasing stride one last time then
+```
