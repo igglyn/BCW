@@ -48,14 +48,15 @@ from BCW.train import run_training
 
 
 # ── constants ──────────────────────────────────────────────────────────────
-PAD_ID  = 256
-VOCAB   = 257       # bytes 0-255 + PAD
+VOCAB   = 256       # bytes 0-255
 D_MODEL = 4
 LAYERS = 1
 
-N_BYTES = 256      # fixed input/output sequence length
+N_BYTES = 131072      # fixed input/output sequence length
 STEPS = 48000
-BS = 64
+STRIDE = N_BYTES // 16   # Left as a debugging option if one needs to test with more samples
+BS = 2 // 2       # effectivly x2 due to above impl
+CHUNK_SIZE = N_BYTES // 8
 
 
 
@@ -72,7 +73,7 @@ def main() -> None:
     if mode == "preprocess":
         text_path  = sys.argv[2] if len(sys.argv) > 2 else "data.txt"
         out_prefix = sys.argv[3] if len(sys.argv) > 3 else "bcw_cache"
-        preprocess_bcw(text_path, out_prefix, N_BYTES)
+        preprocess_bcw(text_path, out_prefix, N_BYTES * 2)
         return
 
     if mode == "train":
@@ -83,6 +84,7 @@ def main() -> None:
 
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    #device = torch.device("cpu")
     print(f"device: {device}")
 
     tr_loader  = make_loader(out_prefix, "tr",  bs=BS,
@@ -90,17 +92,18 @@ def main() -> None:
     val_loader = make_loader(out_prefix, "val", bs=BS,
                              shuffle=False, num_workers=num_workers)
 
-    model = BCW(vocab_size=VOCAB, ctx_length=N_BYTES, d=D_MODEL, depth=LAYERS).to(device)
+    model = BCW(vocab_size=VOCAB, ctx_length=N_BYTES, d=D_MODEL, depth=LAYERS, chunk_size=CHUNK_SIZE).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"BCW params: {n_params:,}")
-    print(f"  shared — encoder: {sum(p.numel() for p in model.encoder.parameters()):,}"
-          f"  gate: {sum(p.numel() for p in model.gate_head.parameters()):,}"
+    print(f"  encoder: {sum(p.numel() for p in model.encoder.parameters()):,}"
+          f"  byte: {sum(p.numel() for p in model.byte_embed.parameters()) + sum(p.numel() for p in model.byte_head.parameters()):,}"
+          f"  compress: {sum(p.numel() for p in model.gate_head.parameters()) + sum(p.numel() for p in model.content_proj.parameters()):,}"
           f"  decoder: {sum(p.numel() for p in model.decoder.parameters()):,}")
 
-    #torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision("high")
 
     run_training(model, tr_loader, val_loader, device,
-                 steps=STEPS, lr=3e-3, lambda_compress=0.1)
+                 steps=STEPS, lr=0.01, stride=STRIDE, lambda_compress=0.1)
 
     torch.save({"config": {"d": D_MODEL, "depth": LAYERS},
                 "state_dict": model.state_dict()}, "bcw.pt")
