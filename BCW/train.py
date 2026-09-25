@@ -32,7 +32,7 @@ def evaluate(model: BCW, loader: DataLoader, stride: int,
 
 
         patches = make_stride_batch(patches.to(device, non_blocking=True), stride)
-        _, _, losses = model.forward(patches)
+        _, _, losses = model.forward(patches, return_gated=False)
         r1, ratio, byte_acc, exact_acc = losses
         r1_vals.append(r1.item())
         r1s.append(ratio.item())
@@ -58,7 +58,7 @@ def full_stats(model: BCW, loader: DataLoader, stride: int,
 
     for patches in loader:
         patches   = make_stride_batch(patches.to(device, non_blocking=True), stride)
-        _, _, losses = model.forward(patches)
+        _, _, losses = model.forward(patches, return_gated=False)
         _, ratio, byte_acc, exact_acc = losses
 
         correct_b += byte_acc
@@ -102,19 +102,18 @@ def run_training(model: BCW, tr_loader: DataLoader,
                 break
             patches = make_stride_batch(patches.to(device, non_blocking=True), stride)
 
-            opt.zero_grad(set_to_none=True)
-            _, logits, losses = model.forward(patches)
+            # First pass provides detached loss balancing and metrics.  The
+            # second pass performs per-chunk backward calls, releasing chunk
+            # activations at each truncated-BPTT boundary.
+            with torch.no_grad():
+                _, _, losses = model.forward(patches, return_gated=False)
             r1, ratio, bacc, eacc = losses
 
             ease = lambda val: 1 / (7 + max(3*log(val.detach(), 10), -6))
-
-            loss = (
-                lambda_r1 * r1
-                 + lambda_compress * ease(r1) * ratio
-                )
-
-
-            loss.backward()
+            opt.zero_grad(set_to_none=True)
+            model.backward_loss(
+                patches, lambda_r1=lambda_r1, lambda_compress=lambda_compress,
+                compression_scale=ease(r1))
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 

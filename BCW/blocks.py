@@ -100,9 +100,12 @@ class SparseGate(nn.Module):
         self.beta      = temperature
         self._mask: Tensor | None = None
 
-    def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
-        # Token gate: score by deviation from global mean (inverted ranker)
-        ctx  = x.mean(1, keepdim=True)                               # (B, 1, D)
+    def forward(self, x: Tensor, mask: Tensor | None = None,
+                context_mean: Tensor | None = None) -> Tensor:
+        # Token gate: score by deviation from a supplied streaming context when
+        # available.  The fallback preserves the original full-window behavior.
+        ctx  = (x.mean(1, keepdim=True) if context_mean is None
+                else context_mean.unsqueeze(1))                      # (B, 1, D)
         dev  = x - ctx                                               # (B, T, D)
         tok  = torch.sigmoid(self.scorer(dev))                       # (B, T, 1)
 
