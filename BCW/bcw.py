@@ -4,9 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.checkpoint import checkpoint
 
-from BCW.blocks import FIREPos
 from BCW.encoder import GeometricEncoder, Position
 
 
@@ -44,11 +42,15 @@ class BCW(nn.Module):
 
     def __init__(self, vocab_size: int, ctx_length: int,
                  d: int = 4, depth: int = 1,
-                 chunk_size: int = 4096):
+                 chunk_size: int = 4096,
+                 detach_state_every: int = 2):
         super().__init__()
         self.d          = d
         self.vocab_size = vocab_size
         self.chunk_size = chunk_size
+        # Two chunks permit gradients into the state updater while bounding the
+        # recurrent autograd horizon.  Set to 0 for full BPTT.
+        self.detach_state_every = detach_state_every
 
         self.byte_embed = nn.Embedding(vocab_size, d)
 
@@ -70,8 +72,9 @@ class BCW(nn.Module):
 
     # ── core shared operations ─────────────────────────────────────────────
 
-    def _encode_gate(self, x: torch.Tensor
-                     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _encode_gate(self, x: torch.Tensor, state: Tensor | None = None, *,
+                     offset: int = 0, sequence_length: int | None = None
+                     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tensor | None]:
         """
         Encode x and produce gated output.
 
@@ -80,10 +83,12 @@ class BCW(nn.Module):
           gated: [B, T, d] real — g*content + (1-g)*pad_embed
           ratio: scalar ∈ (0,1) — mean gate value (compression ratio)
           z_rc:  [B, T, 2*d]   — raw-cartesian encoder output (pre-gate)
+          state: fixed-size context state for the next chunk
         """
         B, T = x.shape[0], x.shape[1]
 
-        z       = checkpoint(self.encoder, x, use_reentrant=False)  # [B, T, d] complex
+        z, state = self.encoder.forward_chunk(
+            x, state, offset=offset, sequence_length=sequence_length) # [B, T, d] complex
         z_rc    = raw_cartesian(z)                                   # [B, T, 2*d]
         g       = torch.sigmoid(self.gate_head(z_rc))               # [B, T, 1]
         content = self.content_proj(z_rc)                           # [B, T, d]
@@ -91,7 +96,7 @@ class BCW(nn.Module):
 
         gated = g * content + (1 - g) * pad                        # [B, T, d]
         ratio = g.mean()
-        return gated, ratio, z_rc
+        return gated, ratio, z_rc, state
 
     def _chunked_decode_loss(self, gated: Tensor, patches: Tensor
                              ) -> tuple[Tensor, float, float, float]:
@@ -132,7 +137,7 @@ class BCW(nn.Module):
 
         return r1, byte_acc, exact_acc, predicted
 
-    def forward(self, patches: torch.Tensor) -> tuple[
+    def forward(self, patches: torch.Tensor, *, return_gated: bool = True) -> tuple[
         Tensor,
         Tensor,
         tuple[float, float, float, float],
@@ -141,14 +146,84 @@ class BCW(nn.Module):
         patches: [B, N_BYTES] long — raw byte IDs (0-255)
 
         Returns:
-          gated:    [B, N_BYTES, d]    — compressed representation
+          gated:    [B, N_BYTES, d] when requested; otherwise an empty tensor
           output:   [B, N_BYTES] uint8 — predicted bytes (argmax, no grad)
           (r1, ratio byte_acc, exact_acc)
         """
-        x = self.byte_embed(patches)                                 # [B, T, d]
-        gated, ratio, _                       = self._encode_gate(x)
-        r1, byte_acc, exact_acc, predicted   = self._chunked_decode_loss(gated, patches)
+        B, T = patches.shape
+        gated_chunks = []
+        predicted_chunks = []
+        r1_total = patches.new_zeros((), dtype=torch.float32)
+        gate_total = patches.new_zeros((), dtype=torch.float32)
+        correct = 0
+        state = None
+
+        # Keep the only cross-chunk dependency in the encoder's compact state.
+        # Decoder/loss activations are confined to one chunk at a time.
+        for chunk_index, start in enumerate(range(0, T, self.chunk_size)):
+            end = min(start + self.chunk_size, T)
+            p_chunk = patches[:, start:end]
+            x_chunk = self.byte_embed(p_chunk)
+            gated, ratio, _, state = self._encode_gate(
+                x_chunk, state, offset=start, sequence_length=T)
+
+            out = self.byte_head(self.decoder(gated))
+            r1_total = r1_total + F.cross_entropy(
+                out.reshape(-1, self.vocab_size), p_chunk.reshape(-1), reduction="sum")
+            gate_total = gate_total + ratio * (B * (end - start))
+            with torch.no_grad():
+                pred = out.argmax(-1).to(torch.uint8)
+                predicted_chunks.append(pred)
+                correct += (pred == p_chunk).sum().item()
+
+            if return_gated:
+                gated_chunks.append(gated)
+            if (self.detach_state_every > 0
+                    and (chunk_index + 1) % self.detach_state_every == 0
+                    and state is not None):
+                state = state.detach()
+
+        r1 = r1_total / (B * T)
+        ratio = gate_total / (B * T)
+        predicted = torch.cat(predicted_chunks, dim=1)
+        byte_acc = correct / (B * T)
+        with torch.no_grad():
+            exact_acc = (predicted == patches).all(dim=-1).float().mean().item()
+        gated = (torch.cat(gated_chunks, dim=1) if return_gated
+                 else patches.new_empty((0,), dtype=torch.float32))
 
         return gated, predicted, (
             r1, ratio, byte_acc, exact_acc,
         )
+
+    def backward_loss(self, patches: Tensor, *, lambda_r1: float,
+                      lambda_compress: float, compression_scale: Tensor) -> None:
+        """Accumulate a training gradient without retaining every chunk graph.
+
+        ``compression_scale`` is derived from a no-grad metrics pass by the
+        caller.  Within a truncated-BPTT group the early chunk backward calls
+        retain the small state graph only until the group's final chunk.
+        """
+        B, T = patches.shape
+        state = None
+        chunks = list(range(0, T, self.chunk_size))
+        for chunk_index, start in enumerate(chunks):
+            end = min(start + self.chunk_size, T)
+            count = B * (end - start)
+            p_chunk = patches[:, start:end]
+            gated, ratio, _, state = self._encode_gate(
+                self.byte_embed(p_chunk), state, offset=start, sequence_length=T)
+            out = self.byte_head(self.decoder(gated))
+            reconstruction = F.cross_entropy(
+                out.reshape(-1, self.vocab_size), p_chunk.reshape(-1), reduction="sum")
+            loss = (lambda_r1 * reconstruction
+                    + lambda_compress * compression_scale * ratio * count) / (B * T)
+
+            is_last_chunk = chunk_index + 1 == len(chunks)
+            is_group_end = (is_last_chunk or (
+                self.detach_state_every > 0
+                and (chunk_index + 1) % self.detach_state_every == 0))
+            loss.backward(retain_graph=not is_group_end)
+            if (is_group_end and self.detach_state_every > 0
+                    and state is not None):
+                state = state.detach()

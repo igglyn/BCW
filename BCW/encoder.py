@@ -5,11 +5,61 @@ import math
 import torch
 from torch import Tensor
 import torch.nn as nn
+import torch.nn.functional as F
 
 from BCW.wave import _lift
 from BCW.blocks import SparseGate
 
 # pyright: reportPrivateUsage=false
+
+
+class ContextualLift(nn.Module):
+    """Bounded-state replacement for the sparse-gate / Wave-lift pair.
+
+    One recurrent state owns both derived contexts: a mean-like context used by
+    the token gate and a positive energy reserve used by the lift.  Processing
+    is chunk causal: state from preceding chunks conditions this chunk, then
+    the chunk's raw and masked summaries update the state for the next one.
+    """
+    def __init__(self, dim: int, gate_temp: float = 1.0):
+        super().__init__()
+        self.proj = nn.Linear(dim, dim)
+        self.gate = SparseGate(dim, gate_temp)
+        self.state_update = nn.GRUCell(2 * dim, dim)
+        self.mean_head = nn.Linear(dim, dim)
+        self.energy_head = nn.Linear(dim, dim)
+        # Start as ordinary running-context statistics, with residual learned
+        # state available to improve on them.
+        nn.init.zeros_(self.mean_head.weight)
+        nn.init.zeros_(self.mean_head.bias)
+        nn.init.zeros_(self.energy_head.weight)
+        nn.init.constant_(self.energy_head.bias, -4.0)
+
+    def initial_state(self, x: Tensor) -> Tensor:
+        return x.new_zeros(x.shape[0], x.shape[-1])
+
+    def forward(self, x: Tensor, state: Tensor | None = None,
+                mask: Tensor | None = None) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        if state is None:
+            state = self.initial_state(x)
+
+        mean_context = self.mean_head(state)
+        gate = self.gate(x, mask, context_mean=mean_context)
+        h = self.proj(x)
+        hm = h * gate
+        hm2 = hm * hm
+
+        # The local term makes the radicand valid for every token in this
+        # chunk.  The learned positive reserve carries predicted prior context.
+        local_energy = hm2.sum(1, keepdim=True)
+        predicted_energy = F.softplus(
+            self.energy_head(state)).unsqueeze(1)
+        energy = local_energy + predicted_energy
+        imag = (energy.expand_as(hm) - hm2).clamp(0).add(1e-6).sqrt() * gate
+
+        summary = torch.cat([x.mean(1), hm2.mean(1)], dim=-1)
+        next_state = self.state_update(summary, state)
+        return hm, imag, gate, next_state
 
 class Position:
     class Mode(str, Enum):
@@ -33,20 +83,22 @@ class Position:
 
 
     @staticmethod
-    def _2d(T: int, width: int, device: torch.device) -> Tensor:
+    def _2d(T: int, width: int, device: torch.device, *, offset: int = 0,
+            total_length: int | None = None) -> Tensor:
         """Half-integer normalised (T, 2) grid positions in (-0.5, 0.5).
 
         Module-level so both WaveStack and GeometricEncoder can use it without
         either owning it.  width is passed explicitly rather than read from self.
         """
-        H    = math.ceil(T / width)
-        idx  = torch.arange(T, device=device)
+        H    = math.ceil((total_length or T) / width)
+        idx  = torch.arange(offset, offset + T, device=device)
         rows = ((idx // width).float() + 0.5) / H     - 0.5
         cols = ((idx  % width).float() + 0.5) / width - 0.5
         return torch.stack([rows, cols], dim=-1)        # (T, 2)
 
     @staticmethod
-    def _3d(T: int, d2: int, d3: int, device: torch.device) -> Tensor:
+    def _3d(T: int, d2: int, d3: int, device: torch.device, *, offset: int = 0,
+            total_length: int | None = None) -> Tensor:
         """Half-integer normalised (T, 3) grid positions in (-0.5, 0.5).
 
         The outermost axis d1 = ceil(T / (d2 * d3)) is computed from T at
@@ -55,8 +107,8 @@ class Position:
         For the auto-cube case d2 = d3 = ceil(max_seq^(1/3)).
         """
         face = d2 * d3
-        D1   = math.ceil(T / face)
-        idx  = torch.arange(T, device=device)
+        D1   = math.ceil((total_length or T) / face)
+        idx  = torch.arange(offset, offset + T, device=device)
         a1   = idx // face
         a2   = (idx % face) // d3
         a3   = idx % d3
@@ -66,7 +118,8 @@ class Position:
         return torch.stack([p1, p2, p3], dim=-1)        # (T, 3)
 
     @staticmethod
-    def _4d(T: int, d2: int, d3: int, d4: int, device: torch.device) -> Tensor:
+    def _4d(T: int, d2: int, d3: int, d4: int, device: torch.device, *, offset: int = 0,
+            total_length: int | None = None) -> Tensor:
         """Half-integer normalised (T, 4) grid positions in (-0.5, 0.5).
 
         The outermost axis d1 = ceil(T / (d2*d3*d4)) is computed at forward
@@ -74,8 +127,8 @@ class Position:
         For the auto-hypercube: d2 = d3 = d4 = ceil(max_seq^(1/4)).
         """
         vol  = d2 * d3 * d4
-        D1   = math.ceil(T / vol)
-        idx  = torch.arange(T, device=device)
+        D1   = math.ceil((total_length or T) / vol)
+        idx  = torch.arange(offset, offset + T, device=device)
         a4   = idx % d4
         a3   = (idx // d4) % d3
         a2   = (idx // (d4 * d3)) % d2
@@ -365,9 +418,46 @@ class GeometricEncoder(nn.Module):
             self.wavelet = WaveletPhase._2D(dim, num_scales)
             self.sct     = SCTPhase._2D()
 
-        self.gate = SparseGate(dim, gate_temp) if sparse else None
+        self.contextual_lift = ContextualLift(dim, gate_temp) if sparse else None
+        # Retain the public gate handle for sparsity diagnostics/costs.
+        self.gate = self.contextual_lift.gate if self.contextual_lift is not None else None
+
+    def initial_state(self, x: Tensor) -> Tensor | None:
+        return None if self.contextual_lift is None else self.contextual_lift.initial_state(x)
+
+    def forward_chunk(self, x: Tensor, state: Tensor | None = None,
+                      mask: Tensor | None = None, *, offset: int = 0,
+                      sequence_length: int | None = None) -> tuple[Tensor, Tensor | None]:
+        """Encode one chunk while carrying only a fixed-size context state."""
+        T = x.shape[1]
+        total = sequence_length or T
+        if self.mode is Position.Mode.FOUR_D:
+            pos = Position._4d(T, self.height, self.depth, self.width, x.device,
+                               offset=offset, total_length=total)
+        elif self.mode is Position.Mode.THREE_D:
+            pos = Position._3d(T, self.depth, self.width, x.device,
+                               offset=offset, total_length=total)
+        else:
+            pos = Position._2d(T, self.width, x.device,
+                               offset=offset, total_length=total)
+
+        if self.contextual_lift is not None:
+            r1, i1, _, next_state = self.contextual_lift(x, state, mask)
+        else:
+            r1, i1 = _lift(self.l1(x), mask)
+            next_state = None
+
+        ang = self.wavelet(pos) + self.sct(pos)
+        r2, i2 = torch.cos(ang), torch.sin(ang)
+        cr, ci = r1*r2 - i1*i2, r1*i2 + i1*r2
+        if mask is not None:
+            cr, ci = cr * mask, ci * mask
+        return torch.view_as_complex(torch.stack([cr, ci], -1)), next_state
 
     def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
+        if self.contextual_lift is not None:
+            z, _ = self.forward_chunk(x, mask=mask)
+            return z
         if self.gate is not None:
             mask = self.gate(x, mask)
 
