@@ -50,13 +50,12 @@ from BCW.train import run_training
 # ── constants ──────────────────────────────────────────────────────────────
 VOCAB   = 256       # bytes 0-255
 D_MODEL = 4
-LAYERS = 1
 
-N_BYTES = 131072      # fixed input/output sequence length
+N_BYTES = 4096      # fixed input/output sequence length
 STEPS = 48000
-STRIDE = N_BYTES // 16   # Left as a debugging option if one needs to test with more samples
-BS = 2 // 2       # effectivly x2 due to above impl
-CHUNK_SIZE = N_BYTES // 8
+CHUNK_SIZE = N_BYTES // 16
+STRIDE = CHUNK_SIZE   # Left as a debugging option if one needs to test with more samples
+BS = 1       # effectivly x2 due to above impl
 
 
 
@@ -84,7 +83,6 @@ def main() -> None:
 
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    #device = torch.device("cpu")
     print(f"device: {device}")
 
     tr_loader  = make_loader(out_prefix, "tr",  bs=BS,
@@ -92,20 +90,19 @@ def main() -> None:
     val_loader = make_loader(out_prefix, "val", bs=BS,
                              shuffle=False, num_workers=num_workers)
 
-    model = BCW(vocab_size=VOCAB, ctx_length=N_BYTES, d=D_MODEL, depth=LAYERS, chunk_size=CHUNK_SIZE).to(device)
+    model = BCW(vocab_size=VOCAB, d=D_MODEL, ctx_length=N_BYTES, chunk_size=CHUNK_SIZE).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"BCW params: {n_params:,}")
     print(f"  encoder: {sum(p.numel() for p in model.encoder.parameters()):,}"
           f"  byte: {sum(p.numel() for p in model.byte_embed.parameters()) + sum(p.numel() for p in model.byte_head.parameters()):,}"
-          f"  compress: {sum(p.numel() for p in model.gate_head.parameters()) + sum(p.numel() for p in model.content_proj.parameters()):,}"
-          f"  decoder: {sum(p.numel() for p in model.decoder.parameters()):,}")
+          f"  compress: {sum(p.numel() for p in model.gate_head.parameters()) + sum(p.numel() for p in model.content_proj.parameters()):,}")
 
     torch.set_float32_matmul_precision("high")
 
     run_training(model, tr_loader, val_loader, device,
-                 steps=STEPS, lr=0.01, stride=STRIDE, lambda_compress=0.1)
+                 steps=STEPS, lr=0.01, stride=STRIDE)
 
-    torch.save({"config": {"d": D_MODEL, "depth": LAYERS},
+    torch.save({"config": {"d": D_MODEL},
                 "state_dict": model.state_dict()}, "bcw.pt")
     print("saved → bcw.pt")
 

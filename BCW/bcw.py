@@ -4,28 +4,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.checkpoint import checkpoint
 
-from BCW.blocks import FIREPos
-from BCW.encoder import GeometricEncoder, Position
+from BCW.encoder import TiledEncoder
 
 
-def raw_cartesian(z: torch.Tensor) -> torch.Tensor:
-    return torch.cat([z.real, z.imag], dim=-1)
-
-
-
-class Decoder(nn.Module):
-    def __init__(self, d: int = 4):
+class LRHead(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
+        self.net = nn.Linear(2 * dim, 1)
+        nn.init.constant_(self.net.bias, 1)
 
-        self.d = d
+    def forward(self, outer_state: Tensor) -> Tensor:
+        raw = self.net(outer_state).mean()
+        return 1e-1 * (1e1 ** torch.sigmoid(raw))
 
-        self.linear = nn.Linear(d, d)
-        self.norm   = nn.LayerNorm(d)
-
-    def forward(self, chunk: Tensor) -> Tensor:
-        return self.norm(self.linear(chunk) + chunk)
 
 class BCW(nn.Module):
     """
@@ -34,7 +26,6 @@ class BCW(nn.Module):
       encoder:      GeometricEncoder — conformal byte-scale encoder
       gate_head:    Linear(2*d, 1) — per-position content/padding decision
       content_proj: Linear(2*d, d) — maps complex encoder output to content d-vector
-      decoder:      Deccoder(d)   — Linear + Norm
 
       pad_embed:    buffer(d)      — learned constant for compressed-away positions
 
@@ -43,8 +34,7 @@ class BCW(nn.Module):
     """
 
     def __init__(self, vocab_size: int, ctx_length: int,
-                 d: int = 4, depth: int = 1,
-                 chunk_size: int = 4096):
+                 d: int = 4, chunk_size: int = 128):
         super().__init__()
         self.d          = d
         self.vocab_size = vocab_size
@@ -55,18 +45,18 @@ class BCW(nn.Module):
         # pad_embed: what a "compressed away" position carries.
         self.register_buffer("pad_embed", torch.zeros(d))
 
-        self.encoder      = GeometricEncoder(d, mode=Position.Mode.FOUR_D,
-                                             # Sparsity is not needed, but if this doesn't exist then it doesn't train
-                                             max_seq=ctx_length, sparse=True)
+        self.encoder      = TiledEncoder(d, n_axes=8, max_seq=ctx_length, tile_size=chunk_size, sparse=True)
+
 
         self.gate_head    = nn.Linear(2 * d, 1)
         self.content_proj = nn.Linear(2 * d, d)
 
-        # ── decoder ───────────────────────────────────────────────────────
-        self.decoder = Decoder(d)
-
         # ── task head ─────────────────────────────────────────────────────
         self.byte_head = nn.Linear(d, vocab_size)
+
+        # --- LR head ------------------------------------------------------
+        #self.lr_head = LRHead(d)
+
 
     # ── core shared operations ─────────────────────────────────────────────
 
@@ -83,17 +73,18 @@ class BCW(nn.Module):
         """
         B, T = x.shape[0], x.shape[1]
 
-        z       = checkpoint(self.encoder, x, use_reentrant=False)  # [B, T, d] complex
-        z_rc    = raw_cartesian(z)                                   # [B, T, 2*d]
+
+        cr, ci, outer = self.encoder(x)                                    # [B, T, d] complex
+        z_rc    = torch.cat([cr, ci], dim=-1)                                   # [B, T, 2*d]
         g       = torch.sigmoid(self.gate_head(z_rc))               # [B, T, 1]
         content = self.content_proj(z_rc)                           # [B, T, d]
         pad     = self.pad_embed.view(1, 1, -1).expand(B, T, -1)
 
         gated = g * content + (1 - g) * pad                        # [B, T, d]
         ratio = g.mean()
-        return gated, ratio, z_rc
+        return gated, ratio, z_rc, outer
 
-    def _chunked_decode_loss(self, gated: Tensor, patches: Tensor
+    def _chunked_loss(self, gated: Tensor, patches: Tensor
                              ) -> tuple[Tensor, float, float, float]:
         """
         Compute r1, byte_acc, exact_acc and predicted bytes
@@ -113,7 +104,7 @@ class BCW(nn.Module):
             g_chunk = gated[:, start:end]                            # [B, cs, d]
             p_chunk = patches[:, start:end]                          # [B, cs]
 
-            out = self.byte_head(self.decoder(g_chunk))              # [B, cs, vocab]
+            out = self.byte_head(g_chunk)                            # [B, cs, vocab]
 
             r1_acc.append(
                 F.cross_entropy(out.reshape(-1, self.vocab_size),
@@ -135,7 +126,7 @@ class BCW(nn.Module):
     def forward(self, patches: torch.Tensor) -> tuple[
         Tensor,
         Tensor,
-        tuple[float, float, float, float],
+        tuple[float, float, float, float, float],
     ]:
         """
         patches: [B, N_BYTES] long — raw byte IDs (0-255)
@@ -146,9 +137,11 @@ class BCW(nn.Module):
           (r1, ratio byte_acc, exact_acc)
         """
         x = self.byte_embed(patches)                                 # [B, T, d]
-        gated, ratio, _                       = self._encode_gate(x)
-        r1, byte_acc, exact_acc, predicted   = self._chunked_decode_loss(gated, patches)
+        gated, ratio, _, encoder_outer       = self._encode_gate(x)
+        #lr_mult = self.lr_head(encode_outer).detach()
 
-        return gated, predicted, (
-            r1, ratio, byte_acc, exact_acc,
+        r1, byte_acc, exact_acc, predicted   = self._chunked_loss(gated, patches)
+
+        return gated, None, (
+            r1, ratio, byte_acc, exact_acc, 1 #lr_mult
         )

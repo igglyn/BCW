@@ -1,4 +1,3 @@
-
 import time
 from math import log
 
@@ -33,7 +32,7 @@ def evaluate(model: BCW, loader: DataLoader, stride: int,
 
         patches = make_stride_batch(patches.to(device, non_blocking=True), stride)
         _, _, losses = model.forward(patches)
-        r1, ratio, byte_acc, exact_acc = losses
+        r1, ratio, byte_acc, exact_acc, _ = losses
         r1_vals.append(r1.item())
         r1s.append(ratio.item())
         byte_accs.append(byte_acc)
@@ -59,7 +58,7 @@ def full_stats(model: BCW, loader: DataLoader, stride: int,
     for patches in loader:
         patches   = make_stride_batch(patches.to(device, non_blocking=True), stride)
         _, _, losses = model.forward(patches)
-        _, ratio, byte_acc, exact_acc = losses
+        _, ratio, byte_acc, exact_acc, _ = losses
 
         correct_b += byte_acc
         correct_c += exact_acc
@@ -76,14 +75,44 @@ def full_stats(model: BCW, loader: DataLoader, stride: int,
 
 # ── training ───────────────────────────────────────────────────────────────
 
+class LearnedLRScheduler:
+    """
+    Applies a per-step LR multiplier from the LR head to the optimizer.
+    
+    Not a torch.optim.lr_scheduler subclass — those assume a predetermined
+    schedule. This is a learned schedule that reads from the model's own
+    state, so it needs to be called with the multiplier after each forward
+    pass rather than stepping on a fixed rule.
+    
+    base_lr is fixed at construction — the multiplier scales around it
+    rather than compounding across steps, so the LR can't drift to
+    extremes over long runs.
+    """
+    def __init__(self, optimizer: torch.optim.Optimizer, base_lr: float, warmup: int = 1000):
+        self.optimizer = optimizer
+        self.base_lr   = base_lr
+        self.current_step = 0
+        self.warmup    = warmup
+
+    def step(self, multiplier: float) -> None:
+        self.current_step += 1
+        if self.current_step < self.warmup:
+            lr = self.base_lr
+        else:
+            lr = self.base_lr * float(multiplier)
+        for group in self.optimizer.param_groups:
+            group['lr'] = lr
+
+
+    @property
+    def current_lr(self) -> float:
+        return self.optimizer.param_groups[0]['lr']
+
 def run_training(model: BCW, tr_loader: DataLoader,
                  val_loader: DataLoader, device: torch.device,
                  steps:            int   = 4000,
                  stride:           int   = 1,
-                 lr:               float = 3e-3,
-                 lambda_r1:        float = 1.0,
-                 lambda_compress:  float = 0.1,
-                 lambda_sparse:    float = 0.001) -> None:
+                 lr:               float = 3e-3) -> None:
     """
     lambda_r1:       cross-entropy weight for pass-1 byte reconstruction.
     lambda_compress: weight on ratio — direct compression budget.
@@ -91,7 +120,10 @@ def run_training(model: BCW, tr_loader: DataLoader,
                      Start at 0.1; increase if model refuses to compress.
     lambda_sparse:   Sarsity loss for weights
     """
+    
     opt    = torch.optim.Adam(model.parameters(), lr=lr)
+    shed = LearnedLRScheduler(opt, lr, warmup=1000)
+    #scaler = torch.amp.GradScaler(device)
 
     t0 = time.time()
     step = 0
@@ -104,19 +136,19 @@ def run_training(model: BCW, tr_loader: DataLoader,
 
             opt.zero_grad(set_to_none=True)
             _, logits, losses = model.forward(patches)
-            r1, ratio, bacc, eacc = losses
+            main, ratio, bacc, eacc, lr_mult = losses
 
-            ease = lambda val: 1 / (7 + max(3*log(val.detach(), 10), -6))
+            #ease = lambda val: 1 / (7 + max(3*log(val.detach(), 10), -6))
 
-            loss = (
-                lambda_r1 * r1
-                 + lambda_compress * ease(r1) * ratio
-                )
+            loss = (main + ratio)
 
-
-            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            loss.backward()
             opt.step()
+            #scaler.scale(loss).backward()
+            #scaler.step(opt)
+            #scaler.update()
+            shed.step(1) #lr_mult)
 
             if step % 100 == 0 or step == steps - 1:
                 val_r1, val_ratio, val_bacc, val_eacc  = evaluate(model, val_loader, stride, device)
@@ -127,17 +159,15 @@ def run_training(model: BCW, tr_loader: DataLoader,
                 print(f"step {step:4d}"
                       f"  |  byte={format(bacc, ".4f") if is_one1 else "Exact!"}"
                       f"  exact={format(eacc, ".4f") if is_one2 else "Exact!"}"
-                      f"  |  r1={r1.item():.4f}"
+                      f"  |  main={main.item():.4f}"
                       f"  ratio={format(ratio.item(), ".4f") if is_zero1 else "WHAT!!"}"
                       #f"  sparse={sparse.item():.4f}"
                       #f"  enc_l1_range={model.encoder.l1.weight.max():.4f}:{model.encoder.l1.weight.min():.4f}"
                       #f"  dec_range={model.decoder.weight.max():.4f}:{model.decoder.weight.min():.4f}"
-                      #f"  lr={lr:.2e}"
+                      f"  lr={shed.current_lr:.4e}"
                       f"  ][  val_byte={val_bacc:.4f}"
                       f"  val_exact={val_eacc:.4f}"
                       f"  |  val_r1={val_r1:.4f}"
                       f"  val_ratio={val_ratio:.4f}"
                       f"  ({time.time()-t0:.1f}s)")
             step += 1
-
-    full_stats(model, val_loader, stride, device)
