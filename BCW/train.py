@@ -171,3 +171,4 @@ def run_training(model: BCW, tr_loader: DataLoader,
                       f"  val_ratio={val_ratio:.4f}"
                       f"  ({time.time()-t0:.1f}s)")
             step += 1
+    full_stats(model, val_loader, stride, device)
