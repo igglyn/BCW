@@ -1,38 +1,24 @@
 """
-Byte Conditioning Wave
-=================================================
-BCW: a byte compressor that takes in N byte positions and reduces into a single embedding
-This uses a teacher/distill pipeline using shared weights between two passes:
- The (encoder/decoder, gate_head, context_proj, pos_embed, pad_embed) weights are shared,
- And (byte_embed, byte_head, lat_head) are kept seperate.
+Byte Conditioning Wave (does need to change def)
+================================================
+BCW: a byte compressor from a dense byte array to a sparse one
+This is just a mostly normal compression pipeline:
+ minus not converting to dense;
+ dense isn't done yet because it is inconvient to do so
 
-Compression mechanism:
-  After encoding, each of the 256 positions is a learned mix of:
-    content = content_proj(raw_cartesian(encoder_output))  [meaningful signal]
-    padding = pad_embed                                    [learned constant]
-  Mixed by a per-position gate g = sigmoid(gate_head(raw_cartesian(z))):
-    gated = g * content + (1-g) * pad_embed
-  Ratio = g.mean() ∈ (0,1) is the fraction of content used.
-  Compression loss = lambda_compress * (ratio1 + ratio2) minimises this.
-  Reconstruction losses (r1, r2) counterbalance: compress too much and
-  quality collapses.  Equilibrium is the minimum ratio the model can
-  afford given its reconstruction targets.
-
-  Gradient path: g is directly in the differentiable gating operation,
-  so d(loss)/d(gate_head) is always non-zero from compression loss and
-  non-zero from reconstruction losses whenever content ≠ pad_embed.
+Compression Mechanism:
+After encoding, all that is done is per-position gate
+ `gated = g * content + (1-g) * pad_embed`
+  ratio is the mean of g in all positions, in other words the amount used
+This form then can be used to argmax to satasify the decoding process
+ - There is no decoder module
 
 Pipeline:
-  pass 1: byte_embed(256) → encoder → gate → gated(256) → decoder → byte_head
-  pass 2: gated(256)      → encoder → gate → gated(256) → decoder → lat_head
-
-The second pass only exists for training, as it will be absorbed by the first
+byte_embed -> TiledEncoder -> gate -> gated -> byte_head -> argmax
 
 Losses:
-  r1:       cross-entropy byte reconstruction (BLT1 task)
-  r2:       MSE latent reconstruction (BLT2 task)
-  compress: ratio1 + ratio2 (compression budget pressure)
-  var/cov:  VICReg on gated sequences across batch×position
+ r1: cross-entropy byte reconstruction (This contains a prediction step)
+ ratio: amount of content used
 
 python main.py preprocess <text.txt> <cache_prefix>
 python main.py train <cache_prefix> [steps] [batch_size] [workers]
