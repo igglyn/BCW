@@ -108,7 +108,7 @@ The origins of this follows a decently well chain of events:
 > There is a lot more to do, but for now let's wrap this up and let it be
 ```
 
-# Present
+# Past
 ```
 > High off of the success of the project
 > There has to be similar places where this can go
@@ -121,10 +121,10 @@ The origins of this follows a decently well chain of events:
 > Offhandedly mention wavelet, which was already supposed to be here
 > "there is no wavelet here"
 > well frick I guess that is also being added this time
-> Capacity constinues to grow, 32k
+> Capacity continues to grow, 32k
 > looking good
 > Next axis is sparsity
-> One of yous really should be implmented outside of this repo
+> One of yous really should be implemented outside of this repo
 > add in the mechanisms in question
 > That is getting up to 131k good
 > I need to deal with these parameters
@@ -171,4 +171,69 @@ The origins of this follows a decently well chain of events:
 > allergic to more steps
 > "odd, you managed to finally how that behavior for a patching model"
 > Increasing stride one last time then
+> Could I really abandon this?
+> Nah I am fixing that VRAM issue even if it kills the ability for the model to work
+> Fist of all, lets chop this in parts and begin chunking
+> minimum prediction needed
+> clueless
+> now while I want to keep the this across more components
+> Draft a decoder module along side to reverse
+> has shape error so refuses to link up, points at gated
+> Forgets the botch
+> Next is dealing with the wavelet and positions
+> I don't need to keep making new modules
+> ND modules it is
+> 4d works better here just due to extra correction
+> Attempts BF16 because why not
+> Majorly unstable but somewhat functions
+> "While I'm doing this axis might as well try this for the lols"
+> dim=2
+> Actually works this time
+> "When I tested this with wave alone it just collapsed"
+> Surely lower walls
+> dim=1 doesn't wall
+> Very odd, single complex not walling was not on my bingo card
+> I have flexible dim calculations what am I doing?
+> 8d
+> that works fine
+> let me just bind the stride to chunk_size right here
+> 16d
+> Nope
+> too greedy, fine
+> bf16 is a nightmare to train due to the branching path
+> Time to revert out of that
+> I'm not done with the shaving though
+> let's see 20% exact and 90% byte accuracy for 2 and 1 respectively
+> Not the best but that 1 sized be looking like a mighty fine conditioning
+> the 2 ain't half bad either
+> *yapping about more changes*
+> the botch resurfaces
+> odd, decoder is basically never used here
+> yeet
+> well that is over 20% of the model saved
+> I guess the encoder is just the entire model now
+```
+
+# Present
+```
+> With a task like reconstruction sure
+> reconstruction
+> wait a moment
+> I've added a prediction task here
+> there is basically nothing stopping me
+> no size limit, no usage spikes, no context limit
+> And this predictor is actually pretty noisy
+> It has the most thin surface to ever exist
+> so much so that dim=1 is completely bottlenecked by pred loss
+> That's the limit of what can be done here
+> Lots of tuning, that is pretty much all of the prams set
+> Can the prediction task even stand up to the level of fun this has been
+> I mean, unlike anywhere else;
+> As long as it works
+> There is no downside
+> But that isn't any fun
+> I do need a model to run
+> All that I can do is clean up the repo
+> So boring
+> Has to be done, so starting with README
 ```
